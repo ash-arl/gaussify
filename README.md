@@ -123,8 +123,17 @@ For each image, at your target `W × H`:
    saved at exactly `W × H`.
 
 Handles both orientations (narrow images → left/right fill; short images →
-top/bottom fill). All the image logic lives in `gaussify.py` under `render()` and
-is importable independently of the GUI. Your original files are never overwritten.
+top/bottom fill). Your original files are never overwritten.
+
+## Code layout
+
+| File | Contents |
+| --- | --- |
+| `gaussify.py` | Entry point — dispatches to the GUI or the self-test. |
+| `gaussify_core.py` | `Settings` + the whole image pipeline (`render()`, `process_file()`). GUI-free and importable on its own. |
+| `gaussify_config.py` | Settings persistence (`gaussify_config.json`) and presets. |
+| `gaussify_gui.py` | The Tkinter application. |
+| `gaussify_selftest.py` | Headless checks of every fill style and docking mode. |
 
 ---
 
