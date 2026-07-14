@@ -3,10 +3,12 @@ Gaussify — Blurred-Fill Wallpaper Processor
 ===========================================
 
 Batch-processes images so they fill a target screen resolution without black
-bars. The original image stays crisp and centered; the empty gutters (left/right
-for narrow images, top/bottom for short ones) are filled with a blurred, zoomed
-copy of the same image that fades out from the sharp center. A "side darkening"
-slider tones the blurred gutters down for a classy look.
+bars. The original image stays crisp; the empty gutters are filled with a
+blurred (or solid, or mirrored) backdrop derived from the same image, fading
+smoothly into the sharp center. Extensive controls: fill style, tint,
+saturation, background zoom, vignette, foreground scale/position (including a
+random left/right dock), drop shadow, and rounded corners. Settings persist
+between sessions and can be saved as named presets.
 
 Run the GUI:      python gaussify.py
 Run a self-test:  python gaussify.py --selftest
@@ -16,11 +18,14 @@ Only dependency: Pillow (pip install Pillow). Tkinter ships with Python.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
+import random
 import sys
 from dataclasses import dataclass
 
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
 # ---------------------------------------------------------------------------
 # Core image processing (no GUI — importable & testable on its own)
@@ -28,33 +33,110 @@ from PIL import Image, ImageEnhance, ImageFilter
 
 SUPPORTED_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "gaussify_config.json")
+
 
 @dataclass
 class Settings:
-    """All knobs that control the blurred-fill effect."""
+    """All knobs that control the fill effect."""
     width: int = 1920
     height: int = 1080
     blur: float = 60.0          # Gaussian blur radius (px) applied to the fill
-    darken: float = 35.0        # 0..100 %, how much to darken the blurred gutters
-    feather: float = 12.0       # 0..40 %, crisp->blur fade width as % of gutter
-    process_matching: bool = False   # also blur-fill images that already fit
+    darken: float = 35.0        # 0..100 %, how much to darken the backdrop
+    feather: float = 12.0       # 0..40 %, crisp->fill fade width as % of gutter
+    process_matching: bool = False   # also process images that already fit
     tolerance: float = 0.02     # aspect match tolerance (fraction of a side)
+    # Background / fill
+    fill_style: str = "blur"    # "blur" | "solid" | "mirror"
+    solid_color: str = "auto"   # "auto" (dominant image color) or "#RRGGBB"
+    bg_zoom: float = 1.0        # 1.0..2.0 extra zoom on the cover-scaled backdrop
+    saturation: float = 100.0   # 0..150 %, backdrop only (100 = unchanged)
+    tint_color: str = "#000000"  # tint overlay color for the backdrop
+    tint_strength: float = 0.0  # 0..100 %, 0 = off
+    vignette: float = 0.0       # 0..100 %, darkened edges over the final image
+    # Foreground (the crisp image)
+    fg_scale: float = 100.0     # 50..100 % of the max fit size
+    fg_position: str = "center"  # "center"|"left"|"right"|"top"|"bottom"|"random"
+    fg_shadow: float = 0.0      # 0..100 drop-shadow strength (blur + opacity)
+    fg_corner_radius: int = 0   # px, rounded corners on the crisp image
+
+
+# Fields that belong to a visual "preset" (everything except output geometry).
+PRESET_FIELDS = (
+    "blur", "darken", "feather", "fill_style", "solid_color", "bg_zoom",
+    "saturation", "tint_color", "tint_strength", "vignette",
+    "fg_scale", "fg_position", "fg_shadow", "fg_corner_radius",
+)
+
+BUILTIN_PRESETS: dict[str, dict] = {
+    "Subtle": dict(blur=40, darken=20, feather=10, fill_style="blur",
+                   bg_zoom=1.0, saturation=100, tint_strength=0, vignette=0,
+                   fg_scale=100, fg_position="center", fg_shadow=0,
+                   fg_corner_radius=0),
+    "Classy": dict(blur=70, darken=45, feather=15, fill_style="blur",
+                   bg_zoom=1.15, saturation=40, tint_color="#1a2a40",
+                   tint_strength=15, vignette=10, fg_scale=100,
+                   fg_position="center", fg_shadow=0, fg_corner_radius=0),
+    "Dramatic": dict(blur=100, darken=60, feather=12, fill_style="blur",
+                     bg_zoom=1.3, saturation=70, tint_strength=0, vignette=35,
+                     fg_scale=92, fg_position="center", fg_shadow=40,
+                     fg_corner_radius=24),
+}
+
+
+def settings_to_dict(s: Settings) -> dict:
+    return dataclasses.asdict(s)
+
+
+def settings_from_dict(d: dict) -> Settings:
+    """Build Settings from a dict, ignoring unknown keys (forward compat)."""
+    fields = {f.name for f in dataclasses.fields(Settings)}
+    return Settings(**{k: v for k, v in d.items() if k in fields})
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass  # persistence is best-effort; never crash the app over it
+
+
+def _parse_hex(color: str, fallback=(0, 0, 0)) -> tuple[int, int, int]:
+    try:
+        c = color.lstrip("#")
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore
+    except (ValueError, IndexError):
+        return fallback
+
+
+def _dominant_color(img: Image.Image) -> tuple[int, int, int]:
+    """Cheap dominant/average color: shrink the image to a single pixel."""
+    return img.resize((1, 1), Image.LANCZOS).getpixel((0, 0))
 
 
 def needs_fill(img_w: int, img_h: int, s: Settings) -> bool:
     """True if the fitted image leaves visible gutters on the target canvas."""
     fit = min(s.width / img_w, s.height / img_h)
-    fitted_w = img_w * fit
-    fitted_h = img_h * fit
-    gap_x = s.width - fitted_w
-    gap_y = s.height - fitted_h
-    # A gutter matters only if it is larger than the tolerance band.
+    gap_x = s.width - img_w * fit
+    gap_y = s.height - img_h * fit
     return (gap_x > s.tolerance * s.width) or (gap_y > s.tolerance * s.height)
 
 
-def _cover_resize(img: Image.Image, w: int, h: int) -> Image.Image:
-    """Scale + center-crop `img` so it completely covers a w x h box."""
-    scale = max(w / img.width, h / img.height)
+def _cover_resize(img: Image.Image, w: int, h: int, zoom: float = 1.0) -> Image.Image:
+    """Scale + center-crop `img` so it completely covers a w x h box.
+    `zoom` > 1 over-scales further before cropping (tighter, more abstract fill)."""
+    scale = max(w / img.width, h / img.height) * max(zoom, 1.0)
     new_w = max(1, round(img.width * scale))
     new_h = max(1, round(img.height * scale))
     resized = img.resize((new_w, new_h), Image.LANCZOS)
@@ -64,105 +146,195 @@ def _cover_resize(img: Image.Image, w: int, h: int) -> Image.Image:
 
 
 def _fit_resize(img: Image.Image, w: int, h: int) -> tuple[Image.Image, int, int]:
-    """Scale `img` to fit inside w x h (letterbox). Returns (img, x, y) offset."""
+    """Scale `img` to fit inside w x h (letterbox), centered. Returns (img, x, y)."""
     scale = min(w / img.width, h / img.height)
     new_w = max(1, round(img.width * scale))
     new_h = max(1, round(img.height * scale))
     resized = img.resize((new_w, new_h), Image.LANCZOS)
-    x = (w - new_w) // 2
-    y = (h - new_h) // 2
-    return resized, x, y
+    return resized, (w - new_w) // 2, (h - new_h) // 2
 
 
-def _edge_fade_profile(length: int, start: int, span: int, feather_px: int) -> list[int]:
+def _place_foreground(img: Image.Image, s: Settings,
+                      rng: random.Random | None = None
+                      ) -> tuple[Image.Image, int, int]:
+    """Fit-resize the crisp image (times fg_scale) and position it on the canvas."""
+    w, h = s.width, s.height
+    fg_frac = min(max(s.fg_scale, 10.0), 100.0) / 100.0
+    scale = min(w / img.width, h / img.height) * fg_frac
+    fw = max(1, round(img.width * scale))
+    fh = max(1, round(img.height * scale))
+    fg = img.resize((fw, fh), Image.LANCZOS)
+
+    pos = s.fg_position
+    if pos == "random":
+        pos = (rng or random).choice(("left", "right"))
+
+    margin = round(0.02 * min(w, h)) if fg_frac < 0.995 else 0
+    x = (w - fw) // 2
+    y = (h - fh) // 2
+    if pos == "left":
+        x = margin
+    elif pos == "right":
+        x = w - fw - margin
+    elif pos == "top":
+        y = margin
+    elif pos == "bottom":
+        y = h - fh - margin
+    return fg, x, y
+
+
+def _mirror_fill(img: Image.Image, w: int, h: int) -> Image.Image:
+    """Backdrop made of the fitted image with gutters filled by mirrored edges."""
+    fg, x, y = _fit_resize(img, w, h)
+    fw, fh = fg.size
+    bg = Image.new("RGB", (w, h), (0, 0, 0))
+    bg.paste(fg, (x, y))
+    if x > 0:  # left/right gutters
+        gw = min(x, fw)
+        bg.paste(ImageOps.mirror(fg.crop((0, 0, gw, fh))), (x - gw, y))
+        gw2 = min(w - (x + fw), fw)
+        bg.paste(ImageOps.mirror(fg.crop((fw - gw2, 0, fw, fh))), (x + fw, y))
+    if y > 0:  # top/bottom gutters
+        gh = min(y, fh)
+        bg.paste(ImageOps.flip(fg.crop((0, 0, fw, gh))), (x, y - gh))
+        gh2 = min(h - (y + fh), fh)
+        bg.paste(ImageOps.flip(fg.crop((0, fh - gh2, fw, fh))), (x, y + fh))
+    return bg
+
+
+def _build_background(img: Image.Image, s: Settings) -> Image.Image:
+    """Full-canvas backdrop in the chosen fill style, then tone adjustments."""
+    w, h = s.width, s.height
+    style = s.fill_style
+
+    if style == "solid":
+        color = (_dominant_color(img) if s.solid_color == "auto"
+                 else _parse_hex(s.solid_color))
+        bg = Image.new("RGB", (w, h), color)
+    elif style == "mirror":
+        bg = _mirror_fill(img, w, h)
+        if s.blur > 0:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=s.blur))
+    else:  # "blur"
+        bg = _cover_resize(img, w, h, zoom=s.bg_zoom)
+        if s.blur > 0:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=s.blur))
+
+    if style != "solid" and abs(s.saturation - 100.0) > 0.5:
+        bg = ImageEnhance.Color(bg).enhance(max(s.saturation, 0.0) / 100.0)
+    if s.darken > 0:
+        bg = ImageEnhance.Brightness(bg).enhance(max(0.0, 1.0 - s.darken / 100.0))
+    if s.tint_strength > 0:
+        tint = Image.new("RGB", (w, h), _parse_hex(s.tint_color))
+        bg = Image.blend(bg, tint, min(s.tint_strength, 100.0) / 100.0)
+    return bg
+
+
+def _edge_fade_profile(length: int, start: int, span: int,
+                       feather_start: int, feather_end: int) -> list[int]:
     """
-    1-D alpha profile of `length` values: 0 outside [start, start+span), 255 in
-    the middle, fading linearly over `feather_px` at each end of the span.
+    1-D alpha profile: 0 outside [start, start+span), 255 inside, fading
+    linearly over `feather_start` px at the start edge and `feather_end` px at
+    the end edge (either may be 0 for a hard edge).
     """
-    feather_px = max(0, min(feather_px, span // 2))
     profile = [0] * length
     end = start + span
     for i in range(max(0, start), min(length, end)):
-        if feather_px <= 0:
-            profile[i] = 255
-        else:
-            d = min(i - start, end - 1 - i)
-            profile[i] = 255 if d >= feather_px else round(255 * d / feather_px)
+        a = 255
+        if feather_start > 0 and (i - start) < feather_start:
+            a = min(a, round(255 * (i - start) / feather_start))
+        if feather_end > 0 and (end - 1 - i) < feather_end:
+            a = min(a, round(255 * (end - 1 - i) / feather_end))
+        profile[i] = a
     return profile
 
 
-def _horizontal_fade_mask(w: int, h: int, x: int, fg_w: int, feather_px: int) -> Image.Image:
-    """
-    Alpha mask (L mode) opaque in the middle columns and fading to transparent
-    over `feather_px` on the left and right edges. Built as a 1-row gradient and
-    stretched to full height (fast — no per-pixel Python loop over the canvas).
-    """
-    profile = _edge_fade_profile(w, x, fg_w, feather_px)
-    row = Image.new("L", (w, 1))
-    row.putdata(profile)
-    return row.resize((w, h), Image.NEAREST)
-
-
-def _vertical_fade_mask(w: int, h: int, y: int, fg_h: int, feather_px: int) -> Image.Image:
-    """Vertical counterpart of `_horizontal_fade_mask` (top/bottom gutters)."""
-    profile = _edge_fade_profile(h, y, fg_h, feather_px)
-    col = Image.new("L", (1, h))
-    col.putdata(profile)
-    return col.resize((w, h), Image.NEAREST)
-
-
-def _build_fade_mask(w: int, h: int, fx: int, fy: int, fg_w: int, fg_h: int,
+def _build_fade_mask(w: int, h: int, fx: int, fy: int, fw: int, fh: int,
                      feather_frac: float) -> Image.Image:
     """
-    Build a feathered alpha mask. Chooses the horizontal or vertical fade based
-    on which gutter exists. `feather_frac` is 0..1 of the gutter size.
+    Feathered alpha mask for a foreground box at (fx, fy, fw, fh). Only edges
+    that actually face a gutter fade; each edge's fade width is `feather_frac`
+    of that gutter. Built from two 1-D gradients multiplied together (fast).
     """
-    gutter_x = (w - fg_w) / 2
-    gutter_y = (h - fg_h) / 2
-    if gutter_x >= gutter_y:
-        # Left/right gutters dominate -> fade the vertical seams.
-        feather_px = int(feather_frac * max(gutter_x, 1))
-        return _horizontal_fade_mask(w, h, fx, fg_w, feather_px)
-    else:
-        feather_px = int(feather_frac * max(gutter_y, 1))
-        return _vertical_fade_mask(w, h, fy, fg_h, feather_px)
+    def edge(gap: int, cap: int) -> int:
+        return min(int(feather_frac * gap), cap) if gap > 2 else 0
+
+    f_left = edge(fx, fw // 2)
+    f_right = edge(w - (fx + fw), fw // 2)
+    f_top = edge(fy, fh // 2)
+    f_bottom = edge(h - (fy + fh), fh // 2)
+
+    row = Image.new("L", (w, 1))
+    row.putdata(_edge_fade_profile(w, fx, fw, f_left, f_right))
+    col = Image.new("L", (1, h))
+    col.putdata(_edge_fade_profile(h, fy, fh, f_top, f_bottom))
+    return ImageChops.multiply(row.resize((w, h), Image.NEAREST),
+                               col.resize((w, h), Image.NEAREST))
 
 
-def render(img: Image.Image, s: Settings) -> Image.Image:
+def _apply_vignette(img: Image.Image, amount: float) -> Image.Image:
+    """Darken edges/corners with a soft radial mask. `amount` is 0..100 %."""
+    if amount <= 0:
+        return img
+    w, h = img.size
+    qw, qh = max(4, w // 8), max(4, h // 8)
+    edge_val = 255 - int(2.55 * min(amount, 100.0))
+    m = Image.new("L", (qw, qh), edge_val)
+    ImageDraw.Draw(m).ellipse(
+        [-qw * 0.18, -qh * 0.18, qw * 1.18, qh * 1.18], fill=255)
+    m = m.filter(ImageFilter.GaussianBlur(radius=max(qw, qh) / 5))
+    m = m.resize((w, h), Image.BILINEAR)
+    return ImageChops.multiply(img, Image.merge("RGB", (m, m, m)))
+
+
+def render(img: Image.Image, s: Settings,
+           rng: random.Random | None = None) -> Image.Image:
     """
-    Produce the final `s.width` x `s.height` blurred-fill image from `img`.
-    If the image already fits and `process_matching` is False, it is fit-scaled
-    onto the canvas unchanged (no blur), which for a matching aspect just fills
-    the screen exactly.
+    Produce the final `s.width` x `s.height` image from `img`.
+
+    If the image already fits at full foreground scale and `process_matching`
+    is False, it is fit-scaled onto the canvas unchanged. Otherwise the crisp
+    foreground is composited over the styled backdrop with a feathered seam,
+    optional drop shadow, rounded corners, and vignette.
     """
     img = img.convert("RGB")
     w, h = s.width, s.height
 
-    fill_needed = needs_fill(img.width, img.height, s)
+    fg, fx, fy = _place_foreground(img, s, rng)
+    fw, fh = fg.size
+    effect_forced = s.fg_scale < 99.5 or s.process_matching
 
-    # Foreground: the crisp, centered, fit-scaled image.
-    fg, fx, fy = _fit_resize(img, w, h)
-
-    if not fill_needed and not s.process_matching:
-        # Nothing to fill (or user opted out): just place the crisp image on a
-        # black canvas. For a truly matching aspect this covers the whole thing.
+    if not needs_fill(img.width, img.height, s) and not effect_forced:
         canvas = Image.new("RGB", (w, h), (0, 0, 0))
         canvas.paste(fg, (fx, fy))
-        return canvas
+        return _apply_vignette(canvas, s.vignette)
 
-    # Background: cover-scaled, blurred, optionally darkened copy.
-    bg = _cover_resize(img, w, h)
-    if s.blur > 0:
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=s.blur))
-    if s.darken > 0:
-        factor = max(0.0, 1.0 - s.darken / 100.0)
-        bg = ImageEnhance.Brightness(bg).enhance(factor)
+    bg = _build_background(img, s)
 
-    # Composite crisp foreground over blurred background with a feathered seam.
-    mask = _build_fade_mask(w, h, fx, fy, fg.width, fg.height, s.feather / 100.0)
+    # Drop shadow: a blurred dark rounded-rect under the foreground box.
+    if s.fg_shadow > 0:
+        strength = min(s.fg_shadow, 100.0) / 100.0
+        sh_blur = max(2.0, strength * min(w, h) * 0.04)
+        offset = round(sh_blur * 0.5)
+        smask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(smask).rounded_rectangle(
+            [fx, fy + offset, fx + fw - 1, fy + fh - 1 + offset],
+            radius=max(s.fg_corner_radius, 0), fill=round(210 * strength))
+        smask = smask.filter(ImageFilter.GaussianBlur(radius=sh_blur))
+        bg.paste((0, 0, 0), (0, 0), smask)
+
+    mask = _build_fade_mask(w, h, fx, fy, fw, fh, s.feather / 100.0)
+    if s.fg_corner_radius > 0:
+        rmask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(rmask).rounded_rectangle(
+            [fx, fy, fx + fw - 1, fy + fh - 1],
+            radius=s.fg_corner_radius, fill=255)
+        mask = ImageChops.multiply(mask, rmask)
+
     fg_full = Image.new("RGB", (w, h), (0, 0, 0))
     fg_full.paste(fg, (fx, fy))
-    return Image.composite(fg_full, bg, mask)
+    out = Image.composite(fg_full, bg, mask)
+    return _apply_vignette(out, s.vignette)
 
 
 def output_path(src: str, out_dir: str, fmt: str) -> str:
@@ -198,34 +370,71 @@ def _selftest() -> int:
     print("Running Gaussify self-test...")
     tmp = tempfile.mkdtemp(prefix="gaussify_test_")
 
-    # A narrow (portrait-ish) image that will leave left/right gutters on 16:9.
+    # A narrow image that leaves left/right gutters on 16:9.
     src = Image.new("RGB", (800, 1000), (200, 30, 30))
     src_path = os.path.join(tmp, "narrow.png")
     src.save(src_path)
 
     s = Settings(width=1920, height=1080, blur=40, darken=30, feather=15)
     assert needs_fill(800, 1000, s), "narrow image should need filling"
+    assert not needs_fill(1920, 1080, s), "matching aspect should not need fill"
 
+    # --- default blur fill ---
     dst = process_file(src_path, tmp, s, fmt="png")
     out = Image.open(dst)
     assert out.size == (1920, 1080), f"expected 1920x1080, got {out.size}"
-
-    # A gutter pixel (far left, middle row) must NOT be pure black — the blurred
-    # fill should have painted something there.
     px = out.getpixel((5, 540))
     assert px != (0, 0, 0), f"gutter pixel is black — fill not applied: {px}"
-
-    # A center pixel should match the crisp source colour closely.
     cx = out.getpixel((960, 540))
     assert abs(cx[0] - 200) < 30, f"center pixel wrong colour: {cx}"
+    print(f"  blur fill ......... gutter {px}, center {cx}  OK")
 
-    # A wide 16:9 image should NOT need filling.
-    assert not needs_fill(1920, 1080, s), "matching aspect should not need fill"
+    # --- solid fill (auto dominant color, no darkening) ---
+    s2 = dataclasses.replace(s, fill_style="solid", solid_color="auto", darken=0)
+    out2 = render(src, s2)
+    px2 = out2.getpixel((5, 540))
+    assert abs(px2[0] - 200) < 30 and px2[1] < 80, f"solid auto fill wrong: {px2}"
+    print(f"  solid fill ........ gutter {px2} (~dominant red)  OK")
 
-    print(f"  output size ....... {out.size}  OK")
-    print(f"  gutter pixel ...... {px}  (non-black)  OK")
-    print(f"  center pixel ...... {cx}  (~source red)  OK")
-    print(f"  written to ........ {dst}")
+    # --- mirror fill ---
+    out3 = render(src, dataclasses.replace(s, fill_style="mirror"))
+    px3 = out3.getpixel((450, 540))  # inside mirrored strip
+    assert px3 != (0, 0, 0), f"mirror fill left gutter black: {px3}"
+    print(f"  mirror fill ....... gutter {px3}  OK")
+
+    # --- docked left / right / random ---
+    outL = render(src, dataclasses.replace(s, fg_position="left"))
+    pL = outL.getpixel((5, 540))
+    assert abs(pL[0] - 200) < 30, f"left-dock: left edge should be crisp: {pL}"
+    outR = render(src, dataclasses.replace(s, fg_position="right"))
+    pR = outR.getpixel((1914, 540))
+    assert abs(pR[0] - 200) < 30, f"right-dock: right edge should be crisp: {pR}"
+    rng = random.Random(42)
+    outRnd = render(src, dataclasses.replace(s, fg_position="random"), rng)
+    lp = outRnd.getpixel((5, 540))
+    rp = outRnd.getpixel((1914, 540))
+    assert (abs(lp[0] - 200) < 30) != (abs(rp[0] - 200) < 30), \
+        "random dock: exactly one side should hold the crisp image"
+    print("  dock left/right/random  OK")
+
+    # --- the works: scaled card + shadow + corners + tint + vignette ---
+    s5 = dataclasses.replace(
+        s, fg_scale=80, fg_shadow=50, fg_corner_radius=40, vignette=30,
+        saturation=50, tint_color="#203050", tint_strength=20, bg_zoom=1.3)
+    out5 = render(src, s5)
+    assert out5.size == (1920, 1080)
+    # The fg box corner should NOT be crisp red (rounded away to backdrop).
+    fg, fx, fy = _place_foreground(src, s5)
+    corner = out5.getpixel((fx + 1, fy + 1))
+    assert abs(corner[0] - 200) >= 30, f"corner should be rounded off: {corner}"
+    print(f"  card+shadow+corners+vignette  OK (corner {corner})")
+
+    # --- settings round-trip & forward compat ---
+    d = settings_to_dict(s5)
+    d["some_future_key"] = 123
+    assert settings_from_dict(d) == s5, "settings round-trip failed"
+    print("  settings round-trip  OK")
+
     print("All checks passed.")
     return 0
 
@@ -237,7 +446,7 @@ def _selftest() -> int:
 def _run_gui() -> int:
     import threading
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
     from PIL import ImageTk
 
     RES_PRESETS = {
@@ -246,6 +455,7 @@ def _run_gui() -> int:
         "3840 x 2160 (4K)": (3840, 2160),
         "Custom": None,
     }
+    FG_POSITIONS = ("center", "left", "right", "top", "bottom", "random")
 
     def detect_screen(widget) -> tuple[int, int]:
         try:
@@ -257,14 +467,19 @@ def _run_gui() -> int:
         def __init__(self, root: tk.Tk):
             self.root = root
             root.title("Gaussify — Blurred-Fill Wallpaper Processor")
-            root.geometry("1120x720")
-            root.minsize(940, 620)
+            root.geometry("1180x780")
+            root.minsize(980, 660)
 
             self.files: list[str] = []
             self.out_dir: str = ""
             self._preview_img = None          # keep a ref so Tk doesn't GC it
             self._preview_after = None        # debounce handle
             self._cur_src: Image.Image | None = None
+            self._cur_path: str = ""
+            self._slider_labels: list[tuple[tk.DoubleVar, ttk.Label]] = []
+            self.solid_color_val = "#336699"
+            self.tint_color_val = "#000000"
+            self.user_presets: dict[str, dict] = {}
 
             scr_w, scr_h = detect_screen(root)
 
@@ -302,8 +517,31 @@ def _run_gui() -> int:
             ctrl = ttk.LabelFrame(root, text="Settings", padding=8)
             ctrl.pack(fill="x", padx=8, pady=(0, 8))
 
-            # Resolution row
-            row1 = ttk.Frame(ctrl)
+            # Presets row (above the tabs)
+            row_p = ttk.Frame(ctrl)
+            row_p.pack(fill="x", pady=(0, 4))
+            ttk.Label(row_p, text="Preset:").pack(side="left")
+            self.preset_var = tk.StringVar(value="")
+            self.preset_combo = ttk.Combobox(row_p, textvariable=self.preset_var,
+                                             width=18, state="readonly")
+            self.preset_combo.pack(side="left", padx=4)
+            self.preset_combo.bind("<<ComboboxSelected>>", self.on_preset_selected)
+            ttk.Button(row_p, text="Save preset…",
+                       command=self.save_preset).pack(side="left", padx=2)
+            ttk.Button(row_p, text="Delete",
+                       command=self.delete_preset).pack(side="left")
+
+            nb = ttk.Notebook(ctrl)
+            nb.pack(fill="x")
+            tab_basic = ttk.Frame(nb, padding=6)
+            tab_bg = ttk.Frame(nb, padding=6)
+            tab_fg = ttk.Frame(nb, padding=6)
+            nb.add(tab_basic, text=" Basics ")
+            nb.add(tab_bg, text=" Background ")
+            nb.add(tab_fg, text=" Foreground ")
+
+            # ===== Basics tab =====
+            row1 = ttk.Frame(tab_basic)
             row1.pack(fill="x", pady=2)
             ttk.Label(row1, text="Resolution:").pack(side="left")
             self.res_var = tk.StringVar(value="1920 x 1080 (1080p)")
@@ -312,42 +550,95 @@ def _run_gui() -> int:
             res_combo.pack(side="left", padx=4)
             res_combo.bind("<<ComboboxSelected>>", self.on_res_change)
             ttk.Label(row1, text="W:").pack(side="left")
-            self.w_var = tk.StringVar(value=str(scr_w if (scr_w, scr_h) else 1920))
-            self.w_entry = ttk.Entry(row1, textvariable=self.w_var, width=6)
-            self.w_entry.pack(side="left")
+            self.w_var = tk.StringVar(value=str(scr_w))
+            ttk.Entry(row1, textvariable=self.w_var, width=6).pack(side="left")
             ttk.Label(row1, text="H:").pack(side="left")
             self.h_var = tk.StringVar(value=str(scr_h))
-            self.h_entry = ttk.Entry(row1, textvariable=self.h_var, width=6)
-            self.h_entry.pack(side="left")
+            ttk.Entry(row1, textvariable=self.h_var, width=6).pack(side="left")
             ttk.Button(row1, text="Use my screen",
-                       command=lambda: self.set_res(scr_w, scr_h)).pack(side="left", padx=8)
-            # start on the detected screen resolution
-            self.set_res(scr_w, scr_h, from_preset=False)
-            self.w_var.trace_add("write", lambda *a: self.schedule_preview())
-            self.h_var.trace_add("write", lambda *a: self.schedule_preview())
+                       command=lambda: self.set_res(scr_w, scr_h, from_preset=False)
+                       ).pack(side="left", padx=8)
 
-            # Sliders row
             self.blur_var = tk.DoubleVar(value=60)
             self.darken_var = tk.DoubleVar(value=35)
             self.feather_var = tk.DoubleVar(value=12)
-            self._add_slider(ctrl, "Blur strength", self.blur_var, 0, 150)
-            self._add_slider(ctrl, "Side darkening (%)", self.darken_var, 0, 100)
-            self._add_slider(ctrl, "Feather / fade (%)", self.feather_var, 0, 40)
+            self._add_slider(tab_basic, "Blur strength", self.blur_var, 0, 150)
+            self._add_slider(tab_basic, "Side darkening (%)", self.darken_var, 0, 100)
+            self._add_slider(tab_basic, "Feather / fade (%)", self.feather_var, 0, 40)
 
-            # Output row
-            row_out = ttk.Frame(ctrl)
-            row_out.pack(fill="x", pady=4)
+            row_misc = ttk.Frame(tab_basic)
+            row_misc.pack(fill="x", pady=2)
             self.process_matching_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(row_out, text="Also process already-matching images",
+            ttk.Checkbutton(row_misc, text="Also process already-matching images",
                             variable=self.process_matching_var,
                             command=self.schedule_preview).pack(side="left")
-            ttk.Label(row_out, text="Format:").pack(side="left", padx=(12, 2))
+            ttk.Label(row_misc, text="Format:").pack(side="left", padx=(12, 2))
             self.fmt_var = tk.StringVar(value="png")
-            ttk.Combobox(row_out, textvariable=self.fmt_var, width=5, state="readonly",
+            ttk.Combobox(row_misc, textvariable=self.fmt_var, width=5, state="readonly",
                          values=["png", "jpg"]).pack(side="left")
 
+            # ===== Background tab =====
+            row_fill = ttk.Frame(tab_bg)
+            row_fill.pack(fill="x", pady=2)
+            ttk.Label(row_fill, text="Fill style:", width=18).pack(side="left")
+            self.fill_style_var = tk.StringVar(value="blur")
+            for style, lbl in (("blur", "Blur"), ("solid", "Solid color"),
+                               ("mirror", "Mirrored")):
+                ttk.Radiobutton(row_fill, text=lbl, value=style,
+                                variable=self.fill_style_var,
+                                command=self.schedule_preview).pack(side="left", padx=4)
+
+            row_solid = ttk.Frame(tab_bg)
+            row_solid.pack(fill="x", pady=2)
+            ttk.Label(row_solid, text="Solid color:", width=18).pack(side="left")
+            self.solid_auto_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(row_solid, text="Auto (from image)",
+                            variable=self.solid_auto_var,
+                            command=self._on_solid_auto).pack(side="left")
+            self.solid_swatch = tk.Button(row_solid, width=3, bg=self.solid_color_val,
+                                          state="disabled",
+                                          command=self.pick_solid_color)
+            self.solid_swatch.pack(side="left", padx=6)
+
+            self.bg_zoom_var = tk.DoubleVar(value=100)      # percent, 100..200
+            self.saturation_var = tk.DoubleVar(value=100)
+            self._add_slider(tab_bg, "Background zoom (%)", self.bg_zoom_var, 100, 200)
+            self._add_slider(tab_bg, "Saturation (%)", self.saturation_var, 0, 150)
+
+            row_tint = ttk.Frame(tab_bg)
+            row_tint.pack(fill="x", pady=2)
+            ttk.Label(row_tint, text="Tint color:", width=18).pack(side="left")
+            self.tint_swatch = tk.Button(row_tint, width=3, bg=self.tint_color_val,
+                                         command=self.pick_tint_color)
+            self.tint_swatch.pack(side="left", padx=6)
+            self.tint_strength_var = tk.DoubleVar(value=0)
+            self._add_slider(tab_bg, "Tint strength (%)", self.tint_strength_var, 0, 100)
+
+            self.vignette_var = tk.DoubleVar(value=0)
+            self._add_slider(tab_bg, "Vignette (%)", self.vignette_var, 0, 100)
+
+            # ===== Foreground tab =====
+            row_pos = ttk.Frame(tab_fg)
+            row_pos.pack(fill="x", pady=2)
+            ttk.Label(row_pos, text="Position:", width=18).pack(side="left")
+            self.fg_pos_var = tk.StringVar(value="center")
+            pos_combo = ttk.Combobox(row_pos, textvariable=self.fg_pos_var, width=10,
+                                     state="readonly", values=list(FG_POSITIONS))
+            pos_combo.pack(side="left")
+            pos_combo.bind("<<ComboboxSelected>>", lambda e: self.schedule_preview())
+            ttk.Label(row_pos, text="(random = docked to a random left/right side per image)",
+                      foreground="#888").pack(side="left", padx=8)
+
+            self.fg_scale_var = tk.DoubleVar(value=100)
+            self.fg_shadow_var = tk.DoubleVar(value=0)
+            self.corner_var = tk.DoubleVar(value=0)
+            self._add_slider(tab_fg, "Image scale (%)", self.fg_scale_var, 50, 100)
+            self._add_slider(tab_fg, "Drop shadow", self.fg_shadow_var, 0, 100)
+            self._add_slider(tab_fg, "Corner radius (px)", self.corner_var, 0, 80)
+
+            # ---- run row ----
             row_run = ttk.Frame(ctrl)
-            row_run.pack(fill="x", pady=4)
+            row_run.pack(fill="x", pady=(6, 0))
             ttk.Button(row_run, text="Output Folder…", command=self.pick_out).pack(side="left")
             self.out_label = ttk.Label(row_run, text="(no output folder)", foreground="#888")
             self.out_label.pack(side="left", padx=8)
@@ -361,6 +652,15 @@ def _run_gui() -> int:
                                     relief="sunken", padding=4)
             self.status.pack(fill="x", side="bottom")
 
+            # width/height changes re-render the preview
+            self.w_var.trace_add("write", lambda *a: self.schedule_preview())
+            self.h_var.trace_add("write", lambda *a: self.schedule_preview())
+
+            # ---- persistence ----
+            self._load_persisted()
+            self._refresh_preset_list()
+            root.protocol("WM_DELETE_WINDOW", self.on_close)
+
         # ---- slider helper ----
         def _add_slider(self, parent, label, var, lo, hi):
             row = ttk.Frame(parent)
@@ -368,6 +668,7 @@ def _run_gui() -> int:
             ttk.Label(row, text=label, width=18).pack(side="left")
             val_lbl = ttk.Label(row, text=f"{var.get():.0f}", width=4)
             val_lbl.pack(side="right")
+            self._slider_labels.append((var, val_lbl))
 
             def on_move(v):
                 val_lbl.config(text=f"{float(v):.0f}")
@@ -377,7 +678,32 @@ def _run_gui() -> int:
                               orient="horizontal", command=on_move)
             scale.pack(side="left", fill="x", expand=True, padx=6)
 
-        # ---- settings gathering ----
+        def _refresh_slider_labels(self):
+            for var, lbl in self._slider_labels:
+                lbl.config(text=f"{var.get():.0f}")
+
+        # ---- color pickers ----
+        def _on_solid_auto(self):
+            self.solid_swatch.config(
+                state="disabled" if self.solid_auto_var.get() else "normal")
+            self.schedule_preview()
+
+        def pick_solid_color(self):
+            c = colorchooser.askcolor(color=self.solid_color_val,
+                                      title="Solid fill color")
+            if c and c[1]:
+                self.solid_color_val = c[1]
+                self.solid_swatch.config(bg=self.solid_color_val)
+                self.schedule_preview()
+
+        def pick_tint_color(self):
+            c = colorchooser.askcolor(color=self.tint_color_val, title="Tint color")
+            if c and c[1]:
+                self.tint_color_val = c[1]
+                self.tint_swatch.config(bg=self.tint_color_val)
+                self.schedule_preview()
+
+        # ---- settings <-> UI ----
         def current_settings(self) -> Settings | None:
             try:
                 w = int(self.w_var.get())
@@ -392,7 +718,133 @@ def _run_gui() -> int:
                 darken=self.darken_var.get(),
                 feather=self.feather_var.get(),
                 process_matching=self.process_matching_var.get(),
+                fill_style=self.fill_style_var.get(),
+                solid_color=("auto" if self.solid_auto_var.get()
+                             else self.solid_color_val),
+                bg_zoom=self.bg_zoom_var.get() / 100.0,
+                saturation=self.saturation_var.get(),
+                tint_color=self.tint_color_val,
+                tint_strength=self.tint_strength_var.get(),
+                vignette=self.vignette_var.get(),
+                fg_scale=self.fg_scale_var.get(),
+                fg_position=self.fg_pos_var.get(),
+                fg_shadow=self.fg_shadow_var.get(),
+                fg_corner_radius=int(self.corner_var.get()),
             )
+
+        def apply_effect_dict(self, d: dict):
+            """Push a preset/persisted effect dict into the UI controls."""
+            s = settings_from_dict({**settings_to_dict(Settings()), **d})
+            self.blur_var.set(s.blur)
+            self.darken_var.set(s.darken)
+            self.feather_var.set(s.feather)
+            self.fill_style_var.set(s.fill_style)
+            self.solid_auto_var.set(s.solid_color == "auto")
+            if s.solid_color != "auto":
+                self.solid_color_val = s.solid_color
+                self.solid_swatch.config(bg=s.solid_color)
+            self._on_solid_auto()
+            self.bg_zoom_var.set(s.bg_zoom * 100.0)
+            self.saturation_var.set(s.saturation)
+            self.tint_color_val = s.tint_color
+            self.tint_swatch.config(bg=s.tint_color)
+            self.tint_strength_var.set(s.tint_strength)
+            self.vignette_var.set(s.vignette)
+            self.fg_scale_var.set(s.fg_scale)
+            self.fg_pos_var.set(s.fg_position)
+            self.fg_shadow_var.set(s.fg_shadow)
+            self.corner_var.set(s.fg_corner_radius)
+            self._refresh_slider_labels()
+            self.schedule_preview()
+
+        def gather_effect_dict(self) -> dict:
+            s = self.current_settings()
+            if s is None:
+                s = Settings()
+            full = settings_to_dict(s)
+            return {k: full[k] for k in PRESET_FIELDS}
+
+        # ---- presets ----
+        def _all_presets(self) -> dict[str, dict]:
+            return {**BUILTIN_PRESETS, **self.user_presets}
+
+        def _refresh_preset_list(self):
+            self.preset_combo.config(values=list(self._all_presets().keys()))
+
+        def on_preset_selected(self, _evt=None):
+            name = self.preset_var.get()
+            preset = self._all_presets().get(name)
+            if preset:
+                self.apply_effect_dict(preset)
+                self.status.config(text=f"Preset '{name}' applied.")
+
+        def save_preset(self):
+            name = simpledialog.askstring("Save preset", "Preset name:",
+                                          parent=self.root)
+            if not name:
+                return
+            name = name.strip()
+            if name in BUILTIN_PRESETS:
+                messagebox.showinfo("Gaussify",
+                                    f"'{name}' is a built-in preset — pick another name.")
+                return
+            self.user_presets[name] = self.gather_effect_dict()
+            self._refresh_preset_list()
+            self.preset_var.set(name)
+            self._save_persisted()
+            self.status.config(text=f"Preset '{name}' saved.")
+
+        def delete_preset(self):
+            name = self.preset_var.get()
+            if not name:
+                return
+            if name in BUILTIN_PRESETS:
+                messagebox.showinfo("Gaussify", "Built-in presets can't be deleted.")
+                return
+            if name in self.user_presets:
+                del self.user_presets[name]
+                self._refresh_preset_list()
+                self.preset_var.set("")
+                self._save_persisted()
+                self.status.config(text=f"Preset '{name}' deleted.")
+
+        # ---- persistence ----
+        def _load_persisted(self):
+            cfg = load_config()
+            self.user_presets = {k: v for k, v in cfg.get("presets", {}).items()
+                                 if isinstance(v, dict)}
+            last = cfg.get("last")
+            if isinstance(last, dict):
+                self.apply_effect_dict(last)
+                if "width" in last and "height" in last:
+                    try:
+                        self.set_res(int(last["width"]), int(last["height"]),
+                                     from_preset=False)
+                    except (TypeError, ValueError):
+                        pass
+                if last.get("process_matching") is not None:
+                    self.process_matching_var.set(bool(last["process_matching"]))
+            fmt = cfg.get("format")
+            if fmt in ("png", "jpg"):
+                self.fmt_var.set(fmt)
+            out_dir = cfg.get("output_dir", "")
+            if out_dir and os.path.isdir(out_dir):
+                self.out_dir = out_dir
+                self.out_label.config(text=out_dir, foreground="#000")
+
+        def _save_persisted(self):
+            s = self.current_settings()
+            cfg = {
+                "last": settings_to_dict(s) if s else {},
+                "presets": self.user_presets,
+                "format": self.fmt_var.get(),
+                "output_dir": self.out_dir,
+            }
+            save_config(cfg)
+
+        def on_close(self):
+            self._save_persisted()
+            self.root.destroy()
 
         # ---- resolution handling ----
         def on_res_change(self, _evt=None):
@@ -404,7 +856,6 @@ def _run_gui() -> int:
             self.w_var.set(str(w))
             self.h_var.set(str(h))
             if not from_preset:
-                # match a preset name if it exists, else Custom
                 for name, val in RES_PRESETS.items():
                     if val == (w, h):
                         self.res_var.set(name)
@@ -447,6 +898,7 @@ def _run_gui() -> int:
             self.listbox.delete(0, "end")
             self.canvas.delete("all")
             self._cur_src = None
+            self._cur_path = ""
             self.status.config(text="List cleared.")
 
         def on_select(self, _evt=None):
@@ -456,8 +908,10 @@ def _run_gui() -> int:
             path = self.files[sel[0]]
             try:
                 self._cur_src = Image.open(path).convert("RGB")
+                self._cur_path = path
             except Exception as e:
                 self._cur_src = None
+                self._cur_path = ""
                 messagebox.showerror("Gaussify", f"Could not open:\n{path}\n\n{e}")
                 return
             self.schedule_preview()
@@ -485,12 +939,14 @@ def _run_gui() -> int:
             scale = min(cw / s.width, ch / s.height, 1.0)
             pv_w = max(1, int(s.width * scale))
             pv_h = max(1, int(s.height * scale))
-            proxy = Settings(width=pv_w, height=pv_h,
-                             blur=s.blur * scale, darken=s.darken,
-                             feather=s.feather,
-                             process_matching=s.process_matching)
+            proxy = dataclasses.replace(
+                s, width=pv_w, height=pv_h, blur=s.blur * scale,
+                fg_corner_radius=max(0, int(round(s.fg_corner_radius * scale))))
+            # Stable random dock per file so the preview doesn't jump around
+            # while dragging sliders; the batch run re-rolls per image.
+            rng = random.Random(self._cur_path)
             try:
-                result = render(self._cur_src, proxy)
+                result = render(self._cur_src, proxy, rng)
             except Exception as e:
                 self.status.config(text=f"Preview error: {e}")
                 return
@@ -498,7 +954,9 @@ def _run_gui() -> int:
             self._preview_img = ImageTk.PhotoImage(result)
             self.canvas.delete("all")
             self.canvas.create_image(cw // 2, ch // 2, image=self._preview_img)
-            fill = "fill" if needs_fill(self._cur_src.width, self._cur_src.height, s) else "no fill (matches)"
+            fill = ("fill" if needs_fill(self._cur_src.width, self._cur_src.height, s)
+                    or s.fg_scale < 99.5 or s.process_matching
+                    else "no fill (matches)")
             self.status.config(
                 text=f"{self._cur_src.width}x{self._cur_src.height}  →  "
                      f"{s.width}x{s.height}   [{fill}]")
@@ -524,6 +982,7 @@ def _run_gui() -> int:
             fmt = self.fmt_var.get()
             self.process_btn.config(state="disabled")
             self.progress.config(maximum=len(self.files), value=0)
+            self._save_persisted()
 
             def worker():
                 errors = []
