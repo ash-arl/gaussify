@@ -56,15 +56,40 @@ python gaussify.py --selftest
    *final* result live — it re-renders instantly as you change settings.
 3. **Set your resolution.** Pick a preset (1080p / 1440p / 4K) from the dropdown,
    type a custom width/height, or click **Use my screen** to match your monitor.
-4. **Tune the effect** with the three sliders (the preview updates as you drag):
-   | Slider | What it does |
+4. **Tune the effect.** Settings are organized into three tabs (the preview
+   updates live as you drag):
+
+   **Basics**
+   | Control | What it does |
    | --- | --- |
-   | **Blur strength** | How soft the filled side gutters are (Gaussian blur radius). |
-   | **Side darkening** | How much to dim the blurred edges — the "classy tone". |
-   | **Feather / fade** | How far the crisp center melts into the blur (softens the seam). |
-5. **Choose output.** Click **Output Folder…**, pick where results should go, and
+   | **Blur strength** | How soft the filled gutters are (Gaussian blur radius). |
+   | **Side darkening** | How much to dim the backdrop — the "classy tone". |
+   | **Feather / fade** | How far the crisp center melts into the fill (softens the seam). |
+
+   **Background**
+   | Control | What it does |
+   | --- | --- |
+   | **Fill style** | *Blur* (zoomed blurred copy), *Solid color* (auto-picked from the image, or your own), or *Mirrored* (gutters reflect the image edges). |
+   | **Background zoom** | How zoomed-in the blurred backdrop is (more zoom = more abstract). |
+   | **Saturation** | Wash out or boost the backdrop's colors. |
+   | **Tint color + strength** | Blend a color over the backdrop (e.g. a cool navy tone). |
+   | **Vignette** | Darken the corners/edges of the final wallpaper. |
+
+   **Foreground**
+   | Control | What it does |
+   | --- | --- |
+   | **Position** | Center, or dock the crisp image left/right/top/bottom — or **random**, which docks each image to a random left/right side with the fill covering the rest. |
+   | **Image scale** | Shrink the crisp image below 100 % for a floating-card look. |
+   | **Drop shadow** | Soft shadow behind the crisp image. |
+   | **Corner radius** | Rounded corners on the crisp image. |
+
+5. **Or just pick a preset.** The **Preset** dropdown ships with **Subtle**,
+   **Classy**, and **Dramatic**. Dial in your own look and hit **Save preset…**
+   to keep it; all settings are also remembered automatically between sessions
+   (stored in `gaussify_config.json` next to the script).
+6. **Choose output.** Click **Output Folder…**, pick where results should go, and
    select **PNG** (lossless) or **JPG** (smaller files).
-6. **Click "Process All."** Every loaded image is rendered at your target
+7. **Click "Process All."** Every loaded image is rendered at your target
    resolution and written to the output folder. A progress bar tracks it.
 
 > By default, images that already match your screen are copied through untouched
@@ -88,12 +113,14 @@ For each image, at your target `W × H`:
 
 1. **Fill needed?** If the fitted image leaves gutters wider than a small
    tolerance, it gets the blurred fill; otherwise it's placed as-is.
-2. **Background** — the image is scaled to *cover* the whole screen
-   (center-cropped), Gaussian-blurred, and optionally darkened.
-3. **Foreground** — the image is scaled to *fit* (letterbox) and centered, crisp.
-4. **Feathered seam** — the crisp image's gutter-facing edges fade into the blur
-   via an alpha gradient, so there's no hard line.
-5. The two are composited and saved at exactly `W × H`.
+2. **Background** — built in the chosen fill style (blurred cover-scaled copy,
+   solid color, or mirrored edges), then saturation / darkening / tint applied.
+3. **Foreground** — the image is scaled to *fit* (letterbox), optionally shrunk
+   and docked to a side, with an optional drop shadow and rounded corners.
+4. **Feathered seam** — only the gutter-facing edges of the crisp image fade
+   into the fill via an alpha gradient, so there's no hard line.
+5. The two are composited, a vignette is optionally applied, and the result is
+   saved at exactly `W × H`.
 
 Handles both orientations (narrow images → left/right fill; short images →
 top/bottom fill). All the image logic lives in `gaussify.py` under `render()` and

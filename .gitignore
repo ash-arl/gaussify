@@ -22,3 +22,6 @@ Thumbs.db
 # Gaussify output (don't commit generated wallpapers)
 output/
 out/
+
+# Gaussify per-user settings
+gaussify_config.json
